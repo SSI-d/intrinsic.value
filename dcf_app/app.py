@@ -149,10 +149,22 @@ def extract_financials(data: dict) -> dict:
         "CommonStockSharesOutstanding",
         "EntityCommonStockSharesOutstanding")
 
+    net_income = get_annual(us_gaap, "NetIncomeLoss")
+
+    equity = get_annual(us_gaap,
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
+
+    dividends = get_annual(us_gaap,
+        "PaymentsOfDividendsCommonStock",
+        "PaymentsOfDividends",
+        "PaymentsOfDividendsAndDividendEquivalentsOnCommonStockAndPreferredStock")
+
     return dict(
         revenue=revenue, ocf=ocf, capex=capex,
         interest=interest, pretax=pretax, tax=tax,
         lt_debt=lt_debt, st_debt=st_debt, cash=cash, shares=shares,
+        net_income=net_income, equity=equity, dividends=dividends,
     )
 
 
@@ -168,23 +180,50 @@ def get_base_fcf(fin: dict) -> float:
 
 
 def get_growth_rate(fin: dict) -> tuple:
+    """Return (blended_g, label, g_hist, g_sust).
+    g_hist  = historical revenue CAGR (backward-looking)
+    g_sust  = sustainable growth rate ROE × retention ratio (fundamental)
+    blended = average of the two when both available.
+    """
     rev = fin["revenue"]
     ocf = fin["ocf"]
     cap = fin["capex"]
 
-    # Historical revenue CAGR (up to 4 years)
+    # ── 1. Historical revenue CAGR ──────────────────────────────────────────
+    g_hist = None
     n = min(len(rev), 4)
     if n >= 2 and rev[n-1] > 0 and rev[0] > 0:
-        cagr = (rev[0] / rev[n-1]) ** (1 / (n-1)) - 1
-        return float(np.clip(cagr, -0.10, 0.40)), f"Historical Revenue CAGR ({n}Y)"
+        g_hist = float(np.clip((rev[0] / rev[n-1]) ** (1/(n-1)) - 1, -0.10, 0.40))
+    else:
+        fcfs = [o - c for o, c in zip(ocf, cap)]
+        if len(fcfs) >= 2 and fcfs[-1] > 0 and fcfs[0] > 0:
+            g_hist = float(np.clip((fcfs[0] / fcfs[-1]) ** (1/(len(fcfs)-1)) - 1, -0.10, 0.35))
 
-    # FCF CAGR fallback
-    fcfs = [o - c for o, c in zip(ocf, cap)]
-    if len(fcfs) >= 2 and fcfs[-1] > 0 and fcfs[0] > 0:
-        cagr = (fcfs[0] / fcfs[-1]) ** (1 / (len(fcfs)-1)) - 1
-        return float(np.clip(cagr, -0.10, 0.35)), "Historical FCF CAGR"
+    # ── 2. Sustainable growth rate = ROE × retention ratio ─────────────────
+    # ROE = Net Income / Equity
+    # Retention ratio = 1 − (Dividends / Net Income)
+    g_sust = None
+    ni    = _first(fin.get("net_income", []))
+    eq    = _first(fin.get("equity",     []))
+    divs  = _first(fin.get("dividends",  []))
+    if ni > 0 and eq > 0:
+        roe       = ni / eq
+        payout    = min(divs / ni, 0.99) if divs > 0 else 0.0
+        retention = 1.0 - payout
+        g_sust    = float(np.clip(roe * retention, 0.0, 0.40))
 
-    return 0.05, "Default (5%)"
+    # ── 3. Blend ────────────────────────────────────────────────────────────
+    available = [x for x in [g_hist, g_sust] if x is not None]
+    if available:
+        g = float(np.mean(available))
+        parts = []
+        if g_hist is not None: parts.append(f"Rev CAGR {g_hist:.1%}")
+        if g_sust is not None: parts.append(f"SGR {g_sust:.1%}")
+        label = "Avg of " + " & ".join(parts)
+    else:
+        g, label = 0.05, "Default (5%)"
+
+    return g, label, g_hist, g_sust
 
 
 def calc_wacc(fin: dict, price: float, beta: float = 1.0, rf: float = 0.043) -> dict:
@@ -294,13 +333,14 @@ if go_btn and sym_input:
         price          = data["price"]
         wacc_d         = calc_wacc(fin, price, beta=data["beta"])
         base_fcf       = get_base_fcf(fin)
-        g, g_source    = get_growth_rate(fin)
+        g, g_source, g_hist, g_sust = get_growth_rate(fin)
         g_term         = 0.025
         dcf            = run_dcf(base_fcf, g, g_term, wacc_d["wacc"], fin)
         verd, upside   = get_verdict(dcf["iv"], price)
 
     for k, v in dict(data=data, fin=fin, wacc_d=wacc_d, base_fcf=base_fcf,
-                     g=g, g_source=g_source, g_term=g_term, dcf=dcf,
+                     g=g, g_source=g_source, g_hist=g_hist, g_sust=g_sust,
+                     g_term=g_term, dcf=dcf,
                      price=price, verd=verd, upside=upside, analyzed=True).items():
         st.session_state[k] = v
 
@@ -316,6 +356,8 @@ if ss.get("analyzed"):
     upside   = ss["upside"]
     g        = ss["g"]
     g_source = ss["g_source"]
+    g_hist   = ss["g_hist"]
+    g_sust   = ss["g_sust"]
     g_term   = ss["g_term"]
     base_fcf = ss["base_fcf"]
 
@@ -386,17 +428,38 @@ if ss.get("analyzed"):
                        yaxis_range=[0, max(price,iv_d)*1.30])
     st.plotly_chart(fig3, use_container_width=True)
 
-    with st.expander("WACC Breakdown"):
-        w1,w2,w3,w4 = st.columns(4)
-        w1.metric("Risk-Free Rate",         f"{wacc_d['rf']:.2%}")
-        w2.metric("Cost of Equity (CAPM)",  f"{wacc_d['ke']:.2%}")
-        w3.metric("After-Tax Cost of Debt", f"{wacc_d['kd']*(1-wacc_d['tax_rate']):.2%}")
-        w4.metric("Effective Tax Rate",     f"{wacc_d['tax_rate']:.1%}")
-        w5,w6 = st.columns(2)
-        w5.metric("Equity Weight", f"{wacc_d['we']:.1%}")
-        w6.metric("Debt Weight",   f"{wacc_d['wd']:.1%}")
-        st.caption("ℹ️  Beta is calculated from 2 years of weekly returns vs S&P 500.")
+    # ── WACC Breakdown ────────────────────────────────────────────────────────
+    st.subheader("WACC Breakdown")
+    st.caption(
+        f"WACC = {wacc_d['we']:.0%} × {wacc_d['ke']:.2%} (equity) "
+        f"+ {wacc_d['wd']:.0%} × {wacc_d['kd']*(1-wacc_d['tax_rate']):.2%} (after-tax debt) "
+        f"= **{wacc_d['wacc']:.2%}**"
+    )
+    w1,w2,w3,w4,w5,w6 = st.columns(6)
+    w1.metric("Risk-Free Rate",         f"{wacc_d['rf']:.2%}", help="US 10Y Treasury yield")
+    w2.metric("Beta",                   f"{wacc_d['beta']:.2f}", help="2Y weekly returns vs S&P 500")
+    w3.metric("Cost of Equity (CAPM)",  f"{wacc_d['ke']:.2%}", help="Rf + β × 5.5% ERP")
+    w4.metric("After-Tax Cost of Debt", f"{wacc_d['kd']*(1-wacc_d['tax_rate']):.2%}", help="Interest / Debt × (1 − tax rate)")
+    w5.metric("Equity Weight",          f"{wacc_d['we']:.1%}")
+    w6.metric("Debt Weight",            f"{wacc_d['wd']:.1%}")
 
+    # ── Growth Rate Breakdown ─────────────────────────────────────────────────
+    st.subheader("Growth Rate Breakdown")
+    st.caption(
+        "Two independent estimates are blended into the Y1–5 growth rate. "
+        "Historical CAGR is backward-looking; Sustainable Growth Rate (SGR = ROE × retention ratio) is fundamentals-based."
+    )
+    ga, gb, gc = st.columns(3)
+    ga.metric("Historical Revenue CAGR",
+              f"{g_hist:.1%}" if g_hist is not None else "n/a",
+              help="Revenue compound annual growth rate from last 4 annual filings")
+    gb.metric("Sustainable Growth Rate",
+              f"{g_sust:.1%}" if g_sust is not None else "n/a",
+              help="SGR = ROE × (1 − dividend payout ratio)")
+    gc.metric("Blended Rate (used in DCF)", f"{g:.1%}",
+              help="Simple average of the two estimates above")
+
+    # ── DCF Bridge ────────────────────────────────────────────────────────────
     with st.expander("DCF Bridge"):
         b1,b2,b3,b4 = st.columns(4)
         b1.metric("Enterprise Value", f"${dcf['ev']/1e9:.1f}B")
