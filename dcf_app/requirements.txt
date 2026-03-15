@@ -3,5 +3,4 @@ yfinance>=0.2.40
 pandas>=2.0.0
 numpy>=1.24.0
 plotly>=5.18.0
-requests-cache>=1.2.0
-requests-ratelimiter>=0.7.0
+curl_cffi>=0.5.10
