@@ -1,6 +1,5 @@
-import time
 import streamlit as st
-import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -10,7 +9,7 @@ st.set_page_config(
     page_title="DCF Valuation",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -19,167 +18,159 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def fetch_with_retry(fn, retries=3, delay=2):
-    """Call fn(), retrying on rate-limit errors with exponential backoff."""
-    for attempt in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            msg = str(e).lower()
-            if "too many requests" in msg or "rate limit" in msg or "429" in msg:
-                if attempt < retries - 1:
-                    time.sleep(delay * (2 ** attempt))
-                    continue
-            raise
-    raise RuntimeError("Yahoo Finance rate limit reached. Please wait a moment and try again.")
+# ── Sidebar — API key ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = st.text_input(
+        "Financial Modeling Prep API Key",
+        type="password",
+        placeholder="Paste your free API key here",
+        help="Get a free key at financialmodelingprep.com/developer/docs",
+    )
+    st.caption(
+        "Get a **free API key** at [financialmodelingprep.com](https://financialmodelingprep.com/developer/docs). "
+        "The free tier allows 250 requests/day — plenty for personal use."
+    )
+    st.divider()
+    st.caption("Risk-free rate is sourced from the US 10Y Treasury yield via FMP.")
 
 # ── Data layer ─────────────────────────────────────────────────────────────────
+BASE = "https://financialmodelingprep.com/api"
+
+def fmp_get(endpoint: str, api_key: str, params: dict = None) -> list | dict:
+    """Make a single FMP API call and return parsed JSON."""
+    p = {"apikey": api_key, **(params or {})}
+    r = requests.get(f"{BASE}{endpoint}", params=p, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        if "Error Message" in data:
+            raise ValueError(data["Error Message"])
+        if "message" in data and "limit" in data["message"].lower():
+            raise ValueError("API limit reached. Upgrade your FMP plan or try again tomorrow.")
+    return data
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_data(symbol: str) -> dict:
-    def _fetch():
-        t = yf.Ticker(symbol)
+def fetch_data(symbol: str, api_key: str) -> dict:
+    profile_data = fmp_get(f"/v3/profile/{symbol}", api_key)
+    if not profile_data:
+        raise ValueError(f"No data found for '{symbol}'. Please check the ticker symbol.")
+    profile = profile_data[0]
 
-        info = t.info
-        if not info or info.get("quoteType") is None:
-            raise ValueError(f"No data found for '{symbol}'. Please check the ticker symbol.")
-        time.sleep(0.4)
+    income   = fmp_get(f"/v3/income-statement/{symbol}",       api_key, {"limit": 4})
+    balance  = fmp_get(f"/v3/balance-sheet-statement/{symbol}", api_key, {"limit": 4})
+    cashflow = fmp_get(f"/v3/cash-flow-statement/{symbol}",    api_key, {"limit": 4})
 
-        income_stmt = t.income_stmt
-        time.sleep(0.4)
-
-        balance_sheet = t.balance_sheet
-        time.sleep(0.4)
-
-        cash_flow = t.cashflow
-        time.sleep(0.4)
-
-        try:
-            growth_est = t.growth_estimates
-        except Exception:
-            growth_est = None
-        time.sleep(0.4)
-
-        rf = _get_rf_rate()
-
-        return {
-            "info": info,
-            "income_stmt": income_stmt,
-            "balance_sheet": balance_sheet,
-            "cash_flow": cash_flow,
-            "growth_est": growth_est,
-            "rf": rf,
-        }
-    return fetch_with_retry(_fetch)
-
-def _safe_fetch(obj):
     try:
-        return obj
+        estimates = fmp_get(f"/v3/analyst-estimates/{symbol}", api_key, {"limit": 3})
     except Exception:
-        return None
+        estimates = []
 
-def _get_rf_rate() -> float:
+    # 10Y Treasury yield for risk-free rate
     try:
-        tnx = yf.Ticker("^TNX")
-        hist = tnx.history(period="5d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1]) / 100
+        treasury = fmp_get("/v4/treasury", api_key, {
+            "from": "2026-01-01", "to": "2026-03-15"
+        })
+        rf = float(sorted(treasury, key=lambda x: x["date"])[-1].get("year10", 4.3)) / 100
     except Exception:
-        pass
-    return 0.045  # fallback: 4.5%
+        rf = 0.043  # fallback ~4.3%
 
-def safe_get(df: pd.DataFrame, keys: list, col: int = 0, default: float = 0.0) -> float:
-    if df is None or df.empty:
-        return default
-    for key in keys:
-        if key in df.index:
-            try:
-                val = df.loc[key].iloc[col]
-                if pd.notna(val):
-                    return float(val)
-            except Exception:
-                continue
-    return default
+    return dict(profile=profile, income=income, balance=balance,
+                cashflow=cashflow, estimates=estimates, rf=rf)
+
 
 # ── Calculation layer ──────────────────────────────────────────────────────────
+def _f(records: list, key: str, index: int = 0, default: float = 0.0) -> float:
+    """Safely extract a float from a FMP records list."""
+    if not records or len(records) <= index:
+        return default
+    val = records[index].get(key)
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def get_base_fcf(data: dict) -> float:
+    cf = data["cashflow"]
+    if not cf:
+        return 0.0
+    fcf = cf[0].get("freeCashFlow")
+    if fcf is not None:
+        return float(fcf)
+    # Fallback: operatingCashFlow + capitalExpenditure (capex is negative in FMP)
+    ocf   = _f(cf, "operatingCashFlow")
+    capex = _f(cf, "capitalExpenditure")
+    return ocf + capex
+
+
 def get_growth_rate(data: dict) -> tuple:
-    """Return (rate, source_label). Uses analyst stockTrend → info fields → historical CAGR."""
-    ge = data.get("growth_est")
+    estimates = data.get("estimates", [])
+    income    = data.get("income",    [])
+    cashflow  = data.get("cashflow",  [])
 
-    # 1. Analyst consensus — stockTrend only (indexTrend is sector-wide, not company-specific)
-    if ge is not None and not ge.empty and "stockTrend" in ge.columns:
-        try:
-            for row_key, label in [("LTG", "Analyst LTG"), ("+1y", "Analyst 1Y"), ("0y", "Analyst Current Year")]:
-                if row_key in ge.index:
-                    val = ge.loc[row_key, "stockTrend"]
-                    if pd.notna(val) and float(val) != 0:
-                        return float(np.clip(float(val), -0.10, 0.40)), label
-        except Exception:
-            pass
+    # 1. Analyst revenue estimate (next FY vs current FY)
+    if estimates and income:
+        curr_rev = _f(income, "revenue", 0)
+        next_rev = _f(estimates, "revenueAvg", 0)
+        if curr_rev > 0 and next_rev > 0:
+            g = (next_rev - curr_rev) / curr_rev
+            return float(np.clip(g, -0.10, 0.40)), "Analyst Revenue Estimate (1Y)"
 
-    # 2. Info fields
-    info = data["info"]
-    for field, label in [("earningsGrowth", "TTM Earnings Growth"), ("revenueGrowth", "TTM Revenue Growth")]:
-        val = info.get(field)
-        if val and pd.notna(val):
-            return float(np.clip(float(val), -0.10, 0.40)), label
+    # 2. Historical revenue CAGR
+    if len(income) >= 2:
+        r0 = _f(income, "revenue", 0)
+        rn = _f(income, "revenue", len(income) - 1)
+        if r0 > 0 and rn > 0:
+            cagr = (r0 / rn) ** (1 / (len(income) - 1)) - 1
+            return float(np.clip(cagr, -0.10, 0.35)), "Historical Revenue CAGR"
 
-    # 3. Historical FCF CAGR fallback
-    cf = data["cash_flow"]
-    for key in ["Operating Cash Flow", "Cash From Operations"]:
-        if cf is not None and not cf.empty and key in cf.index:
-            series = cf.loc[key].dropna()
-            if len(series) >= 2 and series.iloc[-1] != 0:
-                cagr = (series.iloc[0] / series.iloc[-1]) ** (1 / (len(series) - 1)) - 1
-                return float(np.clip(cagr, -0.10, 0.35)), "Historical FCF CAGR"
+    # 3. Historical FCF CAGR
+    if len(cashflow) >= 2:
+        f0 = get_base_fcf({"cashflow": [cashflow[0]]})
+        fn = get_base_fcf({"cashflow": [cashflow[-1]]})
+        if f0 > 0 and fn > 0:
+            cagr = (f0 / fn) ** (1 / (len(cashflow) - 1)) - 1
+            return float(np.clip(cagr, -0.10, 0.35)), "Historical FCF CAGR"
 
     return 0.05, "Default (5%)"
 
 
-def get_base_fcf(data: dict) -> float:
-    cf = data["cash_flow"]
-    ocf = safe_get(cf, ["Operating Cash Flow", "Cash From Operations"])
-    capex = safe_get(cf, ["Capital Expenditure"])  # negative in yfinance
-    return ocf + capex
-
-
 def calc_wacc(data: dict) -> dict:
-    info = data["info"]
-    inc = data["income_stmt"]
-    bal = data["balance_sheet"]
-    rf = data["rf"]
-    erp = 0.055  # Damodaran equity risk premium
+    profile  = data["profile"]
+    income   = data["income"]
+    balance  = data["balance"]
+    rf       = data["rf"]
+    erp      = 0.055  # Damodaran equity risk premium
 
-    beta = float(info.get("beta") or 1.0)
+    beta = float(profile.get("beta") or 1.0)
     beta = float(np.clip(beta, 0.1, 3.0))
-    ke = rf + beta * erp
+    ke   = rf + beta * erp
 
-    total_debt = safe_get(bal, ["Total Debt", "Long Term Debt"])
-    interest_exp = abs(safe_get(inc, ["Interest Expense"]))
+    total_debt  = _f(balance, "totalDebt")
+    interest_exp = abs(_f(income, "interestExpense"))
     kd = (interest_exp / total_debt) if total_debt > 0 else 0.05
     kd = float(np.clip(kd, 0.02, 0.15))
 
-    pretax = safe_get(inc, ["Pretax Income", "Income Before Tax"])
-    tax_prov = safe_get(inc, ["Tax Provision", "Income Tax Expense"])
+    pretax   = _f(income, "incomeBeforeTax")
+    tax_prov = _f(income, "incomeTaxExpense")
     tax_rate = (tax_prov / pretax) if pretax > 0 else 0.21
     tax_rate = float(np.clip(tax_rate, 0.0, 0.40))
 
-    mkt_cap = float(info.get("marketCap") or 0)
+    mkt_cap  = float(profile.get("mktCap") or 0)
     total_ev = mkt_cap + total_debt
-    we = mkt_cap / total_ev if total_ev > 0 else 1.0
+    we = mkt_cap  / total_ev if total_ev > 0 else 1.0
     wd = total_debt / total_ev if total_ev > 0 else 0.0
 
     wacc = we * ke + wd * kd * (1 - tax_rate)
 
-    return dict(
-        wacc=wacc, ke=ke, kd=kd, beta=beta, rf=rf,
-        tax_rate=tax_rate, we=we, wd=wd, total_debt=total_debt,
-    )
+    return dict(wacc=wacc, ke=ke, kd=kd, beta=beta, rf=rf,
+                tax_rate=tax_rate, we=we, wd=wd, total_debt=total_debt)
 
 
 def run_dcf(base_fcf: float, g: float, g_term: float, wacc: float, data: dict) -> dict:
-    """Project FCFs fading from g → g_term over years 6–10, discount to PV."""
     if wacc <= g_term:
-        g_term = wacc - 0.005  # prevent division-by-zero in terminal value
+        g_term = wacc - 0.005
 
     fcfs, pv_fcfs, growth_rates = [], [], []
     for yr in range(1, 11):
@@ -193,29 +184,23 @@ def run_dcf(base_fcf: float, g: float, g_term: float, wacc: float, data: dict) -
         fcfs.append(fcf)
         pv_fcfs.append(fcf / (1 + wacc) ** yr)
 
-    tv = fcfs[-1] * (1 + g_term) / (wacc - g_term)
+    tv    = fcfs[-1] * (1 + g_term) / (wacc - g_term)
     pv_tv = tv / (1 + wacc) ** 10
-    ev = sum(pv_fcfs) + pv_tv
+    ev    = sum(pv_fcfs) + pv_tv
 
-    bal = data["balance_sheet"]
-    info = data["info"]
-    cash = safe_get(bal, [
-        "Cash And Cash Equivalents",
-        "Cash Cash Equivalents And Short Term Investments",
-        "Cash And Short Term Investments",
-    ])
+    balance  = data["balance"]
+    profile  = data["profile"]
+    cash     = _f(balance, "cashAndShortTermInvestments") or _f(balance, "cashAndCashEquivalents")
     total_debt = data.get("wacc_details", {}).get("total_debt", 0.0)
-    net_debt = total_debt - cash
+    net_debt   = total_debt - cash
     equity_val = ev - net_debt
-    shares = float(info.get("sharesOutstanding") or 1)
-    iv = equity_val / shares
+    shares     = float(profile.get("sharesOutstanding") or 1)
+    iv         = equity_val / shares
 
-    return dict(
-        fcfs=fcfs, pv_fcfs=pv_fcfs, growth_rates=growth_rates,
-        pv_tv=pv_tv, total_pv_fcfs=sum(pv_fcfs),
-        ev=ev, equity_val=equity_val, iv=iv,
-        net_debt=net_debt, cash=cash,
-    )
+    return dict(fcfs=fcfs, pv_fcfs=pv_fcfs, growth_rates=growth_rates,
+                pv_tv=pv_tv, total_pv_fcfs=sum(pv_fcfs),
+                ev=ev, equity_val=equity_val, iv=iv,
+                net_debt=net_debt, cash=cash)
 
 
 def get_verdict(iv: float, price: float) -> tuple:
@@ -245,6 +230,14 @@ def render_verdict_banner(verd: str, upside: float):
 st.title("📊 DCF Intrinsic Value Calculator")
 st.caption("Estimate the intrinsic value of any publicly traded company using discounted cash flow analysis.")
 
+# API key gate
+if not api_key:
+    st.info(
+        "👈  **Enter your free FMP API key in the sidebar to get started.**  \n"
+        "Get one in 30 seconds at [financialmodelingprep.com/developer/docs](https://financialmodelingprep.com/developer/docs)"
+    )
+    st.stop()
+
 c1, c2 = st.columns([5, 1])
 with c1:
     sym_input = st.text_input(
@@ -261,10 +254,7 @@ if go_btn and sym_input:
 
     with st.spinner(f"Fetching data for {sym}…"):
         try:
-            data = fetch_data(sym)
-        except RuntimeError as e:
-            st.error(str(e))
-            st.stop()
+            data = fetch_data(sym, api_key)
         except Exception as e:
             st.error(f"Could not load data for **{sym}**: {e}")
             st.stop()
@@ -277,13 +267,8 @@ if go_btn and sym_input:
         g_term = 0.025
         dcf = run_dcf(base_fcf, g, g_term, wacc_d["wacc"], data)
 
-        info = data["info"]
-        price = float(
-            info.get("currentPrice")
-            or info.get("regularMarketPrice")
-            or info.get("previousClose")
-            or 0
-        )
+        profile = data["profile"]
+        price   = float(profile.get("price") or 0)
         verd, upside = get_verdict(dcf["iv"], price)
 
     for k, v in dict(
@@ -296,24 +281,25 @@ if go_btn and sym_input:
 # ── Display results ────────────────────────────────────────────────────────────
 ss = st.session_state
 if ss.get("analyzed"):
-    data   = ss["data"]
-    info   = data["info"]
-    wacc_d = ss["wacc_d"]
-    dcf    = ss["dcf"]
-    price  = ss["price"]
-    verd   = ss["verd"]
-    upside = ss["upside"]
-    g      = ss["g"]
+    data     = ss["data"]
+    profile  = data["profile"]
+    wacc_d   = ss["wacc_d"]
+    dcf      = ss["dcf"]
+    price    = ss["price"]
+    verd     = ss["verd"]
+    upside   = ss["upside"]
+    g        = ss["g"]
     g_source = ss["g_source"]
-    g_term = ss["g_term"]
+    g_term   = ss["g_term"]
+    base_fcf = ss["base_fcf"]
 
     st.divider()
 
     # Company header
-    mkt_cap = info.get("marketCap", 0) or 0
-    st.subheader(f"{info.get('longName', info.get('symbol', '—'))}  ({info.get('symbol', '—')})")
+    mkt_cap = float(profile.get("mktCap") or 0)
+    st.subheader(f"{profile.get('companyName', profile.get('symbol', '—'))}  ({profile.get('symbol', '—')})")
     st.caption(
-        f"{info.get('sector', '—')} · {info.get('industry', '—')} · "
+        f"{profile.get('sector', '—')} · {profile.get('industry', '—')} · "
         f"Market Cap ${mkt_cap / 1e9:.1f}B"
     )
 
@@ -327,7 +313,6 @@ if ss.get("analyzed"):
     m4.metric("Growth Rate (Y1–5)", f"{g:.1%}", help=f"Source: {g_source}")
     m5.metric("Beta", f"{wacc_d['beta']:.2f}")
 
-    base_fcf = ss["base_fcf"]
     if base_fcf < 0:
         st.warning(
             f"⚠️  Base FCF is negative (${base_fcf / 1e9:.2f}B). "
@@ -374,9 +359,9 @@ if ss.get("analyzed"):
 
     # Price vs intrinsic value
     st.subheader("Market Price vs Intrinsic Value")
-    iv_display = max(dcf["iv"], 0)
-    cheap = dcf["iv"] > price
-    bar_colors = ["#94a3b8", "#22c55e"] if cheap else ["#94a3b8", "#ef4444"]
+    iv_display  = max(dcf["iv"], 0)
+    cheap       = dcf["iv"] > price
+    bar_colors  = ["#94a3b8", "#22c55e"] if cheap else ["#94a3b8", "#ef4444"]
 
     fig3 = go.Figure(go.Bar(
         x=["Current Market Price", "Intrinsic Value (DCF)"],
@@ -396,21 +381,22 @@ if ss.get("analyzed"):
     # WACC breakdown
     with st.expander("WACC Breakdown"):
         w1, w2, w3, w4 = st.columns(4)
-        w1.metric("Risk-Free Rate", f"{wacc_d['rf']:.2%}")
+        w1.metric("Risk-Free Rate",        f"{wacc_d['rf']:.2%}")
         w2.metric("Cost of Equity (CAPM)", f"{wacc_d['ke']:.2%}")
-        w3.metric("After-Tax Cost of Debt", f"{wacc_d['kd'] * (1 - wacc_d['tax_rate']):.2%}")
-        w4.metric("Effective Tax Rate", f"{wacc_d['tax_rate']:.1%}")
+        w3.metric("After-Tax Cost of Debt",f"{wacc_d['kd'] * (1 - wacc_d['tax_rate']):.2%}")
+        w4.metric("Effective Tax Rate",    f"{wacc_d['tax_rate']:.1%}")
         w5, w6 = st.columns(2)
         w5.metric("Equity Weight", f"{wacc_d['we']:.1%}")
-        w6.metric("Debt Weight", f"{wacc_d['wd']:.1%}")
+        w6.metric("Debt Weight",   f"{wacc_d['wd']:.1%}")
 
     # DCF bridge
     with st.expander("DCF Bridge"):
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("Enterprise Value", f"${dcf['ev'] / 1e9:.1f}B")
-        b2.metric("Net Debt", f"${dcf['net_debt'] / 1e9:.1f}B")
-        b3.metric("Equity Value", f"${dcf['equity_val'] / 1e9:.1f}B")
-        b4.metric("Shares Outstanding", f"{(info.get('sharesOutstanding') or 0) / 1e9:.2f}B")
+        b2.metric("Net Debt",         f"${dcf['net_debt'] / 1e9:.1f}B")
+        b3.metric("Equity Value",     f"${dcf['equity_val'] / 1e9:.1f}B")
+        shares_out = float(profile.get("sharesOutstanding") or 0)
+        b4.metric("Shares Outstanding", f"{shares_out / 1e9:.2f}B")
 
     # ── Override section ──────────────────────────────────────────────────────
     st.divider()
@@ -450,9 +436,9 @@ if ss.get("analyzed"):
         r1, r2, r3, r4 = st.columns(4)
         r1.metric("Revised Intrinsic Value", f"${max(dcf2['iv'], 0):.2f}",
                   delta=f"{dcf2['iv'] - dcf['iv']:+.2f} vs base case")
-        r2.metric("Market Price", f"${price:.2f}")
+        r2.metric("Market Price",      f"${price:.2f}")
         r3.metric("Upside / Downside", f"{upside2:+.1f}%")
-        r4.metric("Verdict", verd2)
+        r4.metric("Verdict",           verd2)
 
         fig_cmp = go.Figure(go.Bar(
             x=["Market Price", "Base Case IV", "Revised IV"],
