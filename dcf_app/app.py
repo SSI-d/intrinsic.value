@@ -8,7 +8,7 @@ st.set_page_config(
     page_title="DCF Valuation",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
@@ -17,145 +17,211 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input(
-        "Alpha Vantage API Key",
-        type="password",
-        placeholder="Paste your free API key here",
-    )
-    st.caption(
-        "Get a **free API key** (500 calls/day, no credit card) at "
-        "[alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key)"
-    )
+# ── Constants ──────────────────────────────────────────────────────────────────
+SEC_HEADERS = {"User-Agent": "dcf-tool contact@example.com"}
+YF_HEADERS  = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-# ── Data layer ─────────────────────────────────────────────────────────────────
-AV = "https://www.alphavantage.co/query"
-
-def av_get(function: str, symbol: str, api_key: str) -> dict:
-    r = requests.get(AV, params={
-        "function": function, "symbol": symbol, "apikey": api_key
-    }, timeout=20)
+# ── Data layer — SEC EDGAR (free, no key) ─────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cik_map() -> dict:
+    r = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers=SEC_HEADERS, timeout=20,
+    )
     r.raise_for_status()
-    data = r.json()
-    if "Error Message" in data:
-        raise ValueError(f"Ticker '{symbol}' not found.")
-    if "Note" in data or "Information" in data:
-        raise ValueError(
-            "API rate limit reached. "
-            "Get a free key at alphavantage.co/support/#api-key (500 calls/day, no card needed)."
-        )
-    return data
+    return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
+
+
+def ticker_to_cik(symbol: str) -> str:
+    cik_map = get_cik_map()
+    cik = cik_map.get(symbol.upper())
+    if not cik:
+        raise ValueError(f"Ticker '{symbol}' not found in SEC EDGAR. Only US-listed companies are supported.")
+    return cik
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_data(symbol: str, api_key: str) -> dict:
-    overview  = av_get("OVERVIEW",          symbol, api_key)
-    quote_raw = av_get("GLOBAL_QUOTE",      symbol, api_key)
-    income_r  = av_get("INCOME_STATEMENT",  symbol, api_key)
-    balance_r = av_get("BALANCE_SHEET",     symbol, api_key)
-    cf_r      = av_get("CASH_FLOW",         symbol, api_key)
+def fetch_data(symbol: str) -> dict:
+    cik = ticker_to_cik(symbol)
 
-    if not overview.get("Symbol"):
-        raise ValueError(f"No data found for '{symbol}'. Check the ticker symbol.")
+    # Company name & sector
+    sub = requests.get(
+        f"https://data.sec.gov/submissions/CIK{cik}.json",
+        headers=SEC_HEADERS, timeout=20,
+    ).json()
+
+    # XBRL financial facts
+    facts_r = requests.get(
+        f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+        headers=SEC_HEADERS, timeout=30,
+    ).json()
+
+    # Price + beta from Yahoo Finance chart API (2y weekly history vs S&P 500)
+    price = 0.0
+    beta  = 1.0
+    try:
+        def yf_closes(sym, interval="1wk", range_="2y"):
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                params={"interval": interval, "range": range_},
+                headers=YF_HEADERS, timeout=15,
+            ).json()
+            result = r["chart"]["result"][0]
+            closes = result["indicators"]["adjclose"][0]["adjclose"]
+            return result["meta"]["regularMarketPrice"], closes
+
+        price, s_closes = yf_closes(symbol)
+        _,     m_closes = yf_closes("^GSPC")
+
+        n    = min(len(s_closes), len(m_closes))
+        s    = np.array(s_closes[-n:], dtype=float)
+        m    = np.array(m_closes[-n:], dtype=float)
+        mask = ~(np.isnan(s) | np.isnan(m))
+        s, m = s[mask], m[mask]
+        if len(s) > 10:
+            s_ret = np.diff(np.log(s))
+            m_ret = np.diff(np.log(m))
+            beta  = float(np.clip(np.cov(s_ret, m_ret)[0,1] / np.var(m_ret), 0.1, 3.0))
+    except Exception:
+        pass
+
+    return dict(cik=cik, sub=sub, facts=facts_r, price=price, beta=beta)
+
+
+# ── XBRL extraction helpers ────────────────────────────────────────────────────
+def get_annual(us_gaap: dict, *tags, n: int = 4) -> list:
+    """Return up to n most-recent annual values, trying tags in order."""
+    for tag in tags:
+        tag_data = us_gaap.get(tag, {}).get("units", {})
+        raw = tag_data.get("USD", tag_data.get("shares", []))
+        annual = [v for v in raw if v.get("form") == "10-K" and v.get("fp") == "FY"]
+        seen, out = set(), []
+        for v in sorted(annual, key=lambda x: x["end"], reverse=True):
+            fy = v.get("fy")
+            if fy not in seen:
+                seen.add(fy)
+                out.append(float(v["val"]))
+            if len(out) >= n:
+                break
+        if out:
+            return out
+    return []
+
+
+def extract_financials(data: dict) -> dict:
+    us_gaap = data["facts"]["facts"]["us-gaap"]
+
+    revenue = get_annual(us_gaap,
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax")
+
+    ocf = get_annual(us_gaap, "NetCashProvidedByUsedInOperatingActivities")
+
+    capex = get_annual(us_gaap,
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "CapitalExpenditureDiscontinuedOperations")
+
+    interest = get_annual(us_gaap,
+        "InterestExpense", "InterestAndDebtExpense",
+        "InterestExpenseDebt")
+
+    pretax = get_annual(us_gaap,
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments")
+
+    tax = get_annual(us_gaap,
+        "IncomeTaxExpenseBenefit", "IncomeTaxesPaid")
+
+    lt_debt = get_annual(us_gaap,
+        "LongTermDebt", "LongTermDebtNoncurrent",
+        "LongTermDebtAndCapitalLeaseObligations")
+
+    st_debt = get_annual(us_gaap,
+        "ShortTermBorrowings", "DebtCurrent",
+        "LongTermDebtCurrent")
+
+    cash = get_annual(us_gaap,
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsAndShortTermInvestments",
+        "CashAndCashEquivalentsPeriodIncreaseDecrease")
+
+    shares = get_annual(us_gaap,
+        "CommonStockSharesOutstanding",
+        "EntityCommonStockSharesOutstanding")
 
     return dict(
-        overview  = overview,
-        price     = float(quote_raw.get("Global Quote", {}).get("05. price", 0) or 0),
-        income    = income_r.get("annualReports",  []),
-        balance   = balance_r.get("annualReports", []),
-        cashflow  = cf_r.get("annualReports",      []),
-        rf        = 0.043,   # US 10Y Treasury approx — user can override WACC
+        revenue=revenue, ocf=ocf, capex=capex,
+        interest=interest, pretax=pretax, tax=tax,
+        lt_debt=lt_debt, st_debt=st_debt, cash=cash, shares=shares,
     )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def _f(records: list, key: str, idx: int = 0, default: float = 0.0) -> float:
-    """Safely extract a float from an AV annual-reports list."""
-    if not records or len(records) <= idx:
-        return default
-    val = records[idx].get(key)
-    try:
-        v = float(val)
-        return v if v == v else default   # NaN guard
-    except (TypeError, ValueError):
-        return default
+def _first(lst: list, default: float = 0.0) -> float:
+    return float(lst[0]) if lst else default
 
 
-# ── Calculations ───────────────────────────────────────────────────────────────
-def get_base_fcf(data: dict) -> float:
-    cf  = data["cashflow"]
-    ocf = _f(cf, "operatingCashflow")
-    capex = _f(cf, "capitalExpenditures")   # positive in AV → subtract
-    return ocf - capex
+# ── Calculation layer ──────────────────────────────────────────────────────────
+def get_base_fcf(fin: dict) -> float:
+    ocf   = _first(fin["ocf"])
+    capex = _first(fin["capex"])
+    return ocf - capex   # capex is positive in EDGAR
 
 
-def get_growth_rate(data: dict) -> tuple:
-    income  = data["income"]
-    cashflow = data["cashflow"]
-    overview = data["overview"]
+def get_growth_rate(fin: dict) -> tuple:
+    rev = fin["revenue"]
+    ocf = fin["ocf"]
+    cap = fin["capex"]
 
-    # 1. Historical revenue CAGR (up to 4 years)
-    n = min(len(income), 4)
-    if n >= 2:
-        r0 = _f(income, "totalRevenue", 0)
-        rn = _f(income, "totalRevenue", n - 1)
-        if r0 > 0 and rn > 0:
-            cagr = (r0 / rn) ** (1 / (n - 1)) - 1
-            return float(np.clip(cagr, -0.10, 0.40)), f"Historical Revenue CAGR ({n}Y)"
+    # Historical revenue CAGR (up to 4 years)
+    n = min(len(rev), 4)
+    if n >= 2 and rev[n-1] > 0 and rev[0] > 0:
+        cagr = (rev[0] / rev[n-1]) ** (1 / (n-1)) - 1
+        return float(np.clip(cagr, -0.10, 0.40)), f"Historical Revenue CAGR ({n}Y)"
 
-    # 2. Historical FCF CAGR
-    fcfs = []
-    for i in range(min(len(cashflow), 4)):
-        ocf   = _f(cashflow, "operatingCashflow",   i)
-        capex = _f(cashflow, "capitalExpenditures",  i)
-        fcfs.append(ocf - capex)
+    # FCF CAGR fallback
+    fcfs = [o - c for o, c in zip(ocf, cap)]
     if len(fcfs) >= 2 and fcfs[-1] > 0 and fcfs[0] > 0:
-        cagr = (fcfs[0] / fcfs[-1]) ** (1 / (len(fcfs) - 1)) - 1
+        cagr = (fcfs[0] / fcfs[-1]) ** (1 / (len(fcfs)-1)) - 1
         return float(np.clip(cagr, -0.10, 0.35)), "Historical FCF CAGR"
 
     return 0.05, "Default (5%)"
 
 
-def calc_wacc(data: dict) -> dict:
-    ov      = data["overview"]
-    income  = data["income"]
-    balance = data["balance"]
-    rf      = data["rf"]
-    erp     = 0.055   # Damodaran equity risk premium
-
-    beta = float(ov.get("Beta") or 1.0)
+def calc_wacc(fin: dict, price: float, beta: float = 1.0, rf: float = 0.043) -> dict:
+    erp = 0.055
     beta = float(np.clip(beta, 0.1, 3.0))
     ke   = rf + beta * erp
 
-    total_debt   = _f(balance, "shortLongTermDebtTotal")
-    interest_exp = abs(_f(income, "interestExpense"))
+    total_debt   = _first(fin["lt_debt"]) + _first(fin["st_debt"])
+    interest_exp = _first(fin["interest"])
     kd = (interest_exp / total_debt) if total_debt > 0 else 0.05
     kd = float(np.clip(kd, 0.02, 0.15))
 
-    pretax   = _f(income, "incomeBeforeTax")
-    tax_prov = _f(income, "incomeTaxExpense")
+    pretax   = _first(fin["pretax"])
+    tax_prov = _first(fin["tax"])
     tax_rate = (tax_prov / pretax) if pretax > 0 else 0.21
     tax_rate = float(np.clip(tax_rate, 0.0, 0.40))
 
-    mkt_cap  = float(ov.get("MarketCapitalization") or 0)
+    shares   = _first(fin["shares"])
+    mkt_cap  = price * shares
     total_ev = mkt_cap + total_debt
     we = mkt_cap   / total_ev if total_ev > 0 else 1.0
     wd = total_debt / total_ev if total_ev > 0 else 0.0
 
     wacc = we * ke + wd * kd * (1 - tax_rate)
+
     return dict(wacc=wacc, ke=ke, kd=kd, beta=beta, rf=rf,
-                tax_rate=tax_rate, we=we, wd=wd, total_debt=total_debt)
+                tax_rate=tax_rate, we=we, wd=wd,
+                total_debt=total_debt, mkt_cap=mkt_cap)
 
 
-def run_dcf(base_fcf: float, g: float, g_term: float, wacc: float, data: dict) -> dict:
+def run_dcf(base_fcf: float, g: float, g_term: float, wacc: float, fin: dict) -> dict:
     if wacc <= g_term:
         g_term = wacc - 0.005
 
     fcfs, pv_fcfs, growth_rates = [], [], []
     for yr in range(1, 11):
-        g_yr = g if yr <= 5 else g * (1 - (yr-5)/5) + g_term * ((yr-5)/5)
+        g_yr = g if yr <= 5 else g * (1-(yr-5)/5) + g_term * ((yr-5)/5)
         growth_rates.append(g_yr)
         fcf = (base_fcf if yr == 1 else fcfs[-1]) * (1 + g_yr)
         fcfs.append(fcf)
@@ -165,15 +231,12 @@ def run_dcf(base_fcf: float, g: float, g_term: float, wacc: float, data: dict) -
     pv_tv = tv / (1 + wacc) ** 10
     ev    = sum(pv_fcfs) + pv_tv
 
-    bal        = data["balance"]
-    ov         = data["overview"]
-    cash       = _f(bal, "cashAndShortTermInvestments") or _f(bal, "cashAndCashEquivalentsAtCarryingValue")
-    total_debt = data.get("wacc_details", {}).get("total_debt", 0.0)
+    cash       = _first(fin["cash"])
+    total_debt = _first(fin["lt_debt"]) + _first(fin["st_debt"])
     net_debt   = total_debt - cash
     equity_val = ev - net_debt
-    shares     = float(ov.get("SharesOutstanding") or
-                       _f(data["balance"], "commonStockSharesOutstanding") or 1)
-    iv = equity_val / shares
+    shares     = _first(fin["shares"])
+    iv         = equity_val / shares if shares > 0 else 0.0
 
     return dict(fcfs=fcfs, pv_fcfs=pv_fcfs, growth_rates=growth_rates,
                 pv_tv=pv_tv, total_pv_fcfs=sum(pv_fcfs),
@@ -204,15 +267,10 @@ def render_verdict_banner(verd: str, upside: float):
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 st.title("📊 DCF Intrinsic Value Calculator")
-st.caption("Estimate the intrinsic value of any publicly traded company using discounted cash flow analysis.")
-
-if not api_key:
-    st.info(
-        "👈  **Enter your free Alpha Vantage API key in the sidebar to get started.**\n\n"
-        "Get one for free (no credit card) at "
-        "[alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) — takes 30 seconds."
-    )
-    st.stop()
+st.caption(
+    "Estimate the intrinsic value of any US-listed company using discounted cash flow analysis. "
+    "Data sourced from SEC EDGAR — no API key required."
+)
 
 c1, c2 = st.columns([5, 1])
 with c1:
@@ -224,25 +282,25 @@ with c2:
 # ── Run analysis ───────────────────────────────────────────────────────────────
 if go_btn and sym_input:
     sym = sym_input.upper().strip()
-    with st.spinner(f"Fetching data for {sym}…"):
+    with st.spinner(f"Fetching SEC filings for {sym}…"):
         try:
-            data = fetch_data(sym, api_key)
+            data = fetch_data(sym)
         except Exception as e:
             st.error(f"Could not load data for **{sym}**: {e}")
             st.stop()
 
     with st.spinner("Running DCF model…"):
-        wacc_d = calc_wacc(data)
-        data["wacc_details"] = wacc_d
-        base_fcf        = get_base_fcf(data)
-        g, g_source     = get_growth_rate(data)
-        g_term          = 0.025
-        dcf             = run_dcf(base_fcf, g, g_term, wacc_d["wacc"], data)
-        price           = data["price"]
-        verd, upside    = get_verdict(dcf["iv"], price)
+        fin            = extract_financials(data)
+        price          = data["price"]
+        wacc_d         = calc_wacc(fin, price, beta=data["beta"])
+        base_fcf       = get_base_fcf(fin)
+        g, g_source    = get_growth_rate(fin)
+        g_term         = 0.025
+        dcf            = run_dcf(base_fcf, g, g_term, wacc_d["wacc"], fin)
+        verd, upside   = get_verdict(dcf["iv"], price)
 
-    for k, v in dict(data=data, wacc_d=wacc_d, base_fcf=base_fcf, g=g,
-                     g_source=g_source, g_term=g_term, dcf=dcf,
+    for k, v in dict(data=data, fin=fin, wacc_d=wacc_d, base_fcf=base_fcf,
+                     g=g, g_source=g_source, g_term=g_term, dcf=dcf,
                      price=price, verd=verd, upside=upside, analyzed=True).items():
         st.session_state[k] = v
 
@@ -250,7 +308,7 @@ if go_btn and sym_input:
 ss = st.session_state
 if ss.get("analyzed"):
     data     = ss["data"]
-    ov       = data["overview"]
+    fin      = ss["fin"]
     wacc_d   = ss["wacc_d"]
     dcf      = ss["dcf"]
     price    = ss["price"]
@@ -261,23 +319,30 @@ if ss.get("analyzed"):
     g_term   = ss["g_term"]
     base_fcf = ss["base_fcf"]
 
-    st.divider()
+    sub      = data["sub"]
+    name     = sub.get("name", sub.get("entityType", "—"))
+    sic_desc = sub.get("sicDescription", "—")
+    mkt_cap  = wacc_d["mkt_cap"]
 
-    mkt_cap = float(ov.get("MarketCapitalization") or 0)
-    st.subheader(f"{ov.get('Name', ov.get('Symbol', '—'))}  ({ov.get('Symbol', '—')})")
-    st.caption(f"{ov.get('Sector','—')} · {ov.get('Industry','—')} · Market Cap ${mkt_cap/1e9:.1f}B")
+    st.divider()
+    st.subheader(f"{name}  ({sub.get('tickers', ['—'])[0] if sub.get('tickers') else '—'})")
+    st.caption(f"{sic_desc} · Market Cap ${mkt_cap/1e9:.1f}B")
 
     render_verdict_banner(verd, upside)
 
+    # Key metrics
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Market Price",       f"${price:.2f}")
     m2.metric("Intrinsic Value",    f"${max(dcf['iv'],0):.2f}", delta=f"{upside:+.1f}%")
     m3.metric("WACC",               f"{wacc_d['wacc']:.1%}")
     m4.metric("Growth Rate (Y1–5)", f"{g:.1%}", help=f"Source: {g_source}")
-    m5.metric("Beta",               f"{wacc_d['beta']:.2f}")
+    m5.metric("Base FCF",           f"${base_fcf/1e9:.1f}B")
 
     if base_fcf < 0:
-        st.warning(f"⚠️  Base FCF is negative (${base_fcf/1e9:.2f}B). Interpret with caution.")
+        st.warning(f"⚠️  Base FCF is negative (${base_fcf/1e9:.2f}B). Interpret the result with caution.")
+
+    if price == 0:
+        st.warning("⚠️  Could not fetch the current price automatically. Use the override below to enter it.")
 
     st.divider()
 
@@ -330,13 +395,14 @@ if ss.get("analyzed"):
         w5,w6 = st.columns(2)
         w5.metric("Equity Weight", f"{wacc_d['we']:.1%}")
         w6.metric("Debt Weight",   f"{wacc_d['wd']:.1%}")
+        st.caption("ℹ️  Beta is calculated from 2 years of weekly returns vs S&P 500.")
 
     with st.expander("DCF Bridge"):
         b1,b2,b3,b4 = st.columns(4)
         b1.metric("Enterprise Value", f"${dcf['ev']/1e9:.1f}B")
         b2.metric("Net Debt",         f"${dcf['net_debt']/1e9:.1f}B")
         b3.metric("Equity Value",     f"${dcf['equity_val']/1e9:.1f}B")
-        shares = float(ov.get("SharesOutstanding") or 0)
+        shares = _first(fin["shares"])
         b4.metric("Shares Outstanding", f"{shares/1e9:.2f}B")
 
     # ── Override ──────────────────────────────────────────────────────────────
@@ -356,7 +422,7 @@ if ss.get("analyzed"):
                             round(wacc_d["wacc"]*100,1), step=0.5) / 100
 
     if st.button("Recalculate with Overrides", type="secondary"):
-        dcf2 = run_dcf(ss["base_fcf"], ov_g, ov_gt, ov_wacc, data)
+        dcf2 = run_dcf(ss["base_fcf"], ov_g, ov_gt, ov_wacc, fin)
         verd2, upside2 = get_verdict(dcf2["iv"], price)
         st.subheader("Revised Valuation")
         render_verdict_banner(verd2, upside2)
@@ -383,5 +449,8 @@ if ss.get("analyzed"):
         st.plotly_chart(fig_cmp, use_container_width=True)
 
     st.divider()
-    st.caption("⚠️ For informational purposes only — not financial advice. "
-               "Always do your own research before making investment decisions.")
+    st.caption(
+        "⚠️ For informational purposes only — not financial advice. "
+        "Data from SEC EDGAR (US companies only). "
+        "Always do your own research before making investment decisions."
+    )
