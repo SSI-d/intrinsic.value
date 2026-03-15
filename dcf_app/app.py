@@ -56,11 +56,13 @@ def fetch_data(symbol: str) -> dict:
         headers=SEC_HEADERS, timeout=30,
     ).json()
 
-    # Price + beta from Yahoo Finance chart API (2y weekly history vs S&P 500)
+    # Price + beta (2Y weekly) + rf + ERP (20Y monthly) — all from Yahoo Finance chart API
     price = 0.0
     beta  = 1.0
+    rf    = 0.045   # safety fallback only — overwritten live below
+    erp   = 0.055   # safety fallback only — overwritten live below
     try:
-        def yf_closes(sym, interval="1wk", range_="2y"):
+        def yf_closes(sym, interval, range_):
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
                 params={"interval": interval, "range": range_},
@@ -70,9 +72,13 @@ def fetch_data(symbol: str) -> dict:
             closes = result["indicators"]["adjclose"][0]["adjclose"]
             return result["meta"]["regularMarketPrice"], closes
 
-        price, s_closes = yf_closes(symbol)
-        _,     m_closes = yf_closes("^GSPC")
+        # ── Risk-free rate: 10Y US Treasury yield (^TNX) ─────────────────
+        tnx_price, _ = yf_closes("%5ETNX", "1d", "5d")
+        rf = float(tnx_price) / 100
 
+        # ── Current price + beta vs S&P 500 (2Y weekly) ──────────────────
+        price, s_closes = yf_closes(symbol,   "1wk", "2y")
+        _,     m_closes = yf_closes("%5EGSPC", "1wk", "2y")
         n    = min(len(s_closes), len(m_closes))
         s    = np.array(s_closes[-n:], dtype=float)
         m    = np.array(m_closes[-n:], dtype=float)
@@ -82,10 +88,19 @@ def fetch_data(symbol: str) -> dict:
             s_ret = np.diff(np.log(s))
             m_ret = np.diff(np.log(m))
             beta  = float(np.clip(np.cov(s_ret, m_ret)[0,1] / np.var(m_ret), 0.1, 3.0))
+
+        # ── ERP: 20Y annualised S&P 500 total return (^SP500TR) minus rf ─
+        # ^SP500TR includes dividends — no hardcoded yield adjustment needed
+        _, sp_tr = yf_closes("%5ESP500TR", "1mo", "20y")
+        sp_tr = [c for c in sp_tr if c is not None]
+        if len(sp_tr) >= 24:
+            years        = len(sp_tr) / 12
+            total_return = (sp_tr[-1] / sp_tr[0]) ** (1 / years) - 1
+            erp          = float(np.clip(total_return - rf, 0.02, 0.12))
     except Exception:
         pass
 
-    return dict(cik=cik, sub=sub, facts=facts_r, price=price, beta=beta)
+    return dict(cik=cik, sub=sub, facts=facts_r, price=price, beta=beta, erp=erp, rf=rf)
 
 
 # ── XBRL extraction helpers ────────────────────────────────────────────────────
@@ -226,8 +241,8 @@ def get_growth_rate(fin: dict) -> tuple:
     return g, label, g_hist, g_sust
 
 
-def calc_wacc(fin: dict, price: float, beta: float = 1.0, rf: float = 0.043) -> dict:
-    erp = 0.055
+def calc_wacc(fin: dict, price: float, beta: float = 1.0,
+              rf: float = 0.043, erp: float = 0.055) -> dict:
     beta = float(np.clip(beta, 0.1, 3.0))
     ke   = rf + beta * erp
 
@@ -249,7 +264,7 @@ def calc_wacc(fin: dict, price: float, beta: float = 1.0, rf: float = 0.043) -> 
 
     wacc = we * ke + wd * kd * (1 - tax_rate)
 
-    return dict(wacc=wacc, ke=ke, kd=kd, beta=beta, rf=rf,
+    return dict(wacc=wacc, ke=ke, kd=kd, beta=beta, rf=rf, erp=erp,
                 tax_rate=tax_rate, we=we, wd=wd,
                 total_debt=total_debt, mkt_cap=mkt_cap)
 
@@ -331,7 +346,8 @@ if go_btn and sym_input:
     with st.spinner("Running DCF model…"):
         fin            = extract_financials(data)
         price          = data["price"]
-        wacc_d         = calc_wacc(fin, price, beta=data["beta"])
+        wacc_d         = calc_wacc(fin, price, beta=data["beta"],
+                                   rf=data["rf"], erp=data["erp"])
         base_fcf       = get_base_fcf(fin)
         g, g_source, g_hist, g_sust = get_growth_rate(fin)
         g_term         = 0.025
@@ -435,13 +451,14 @@ if ss.get("analyzed"):
         f"+ {wacc_d['wd']:.0%} × {wacc_d['kd']*(1-wacc_d['tax_rate']):.2%} (after-tax debt) "
         f"= **{wacc_d['wacc']:.2%}**"
     )
-    w1,w2,w3,w4,w5,w6 = st.columns(6)
-    w1.metric("Risk-Free Rate",         f"{wacc_d['rf']:.2%}", help="US 10Y Treasury yield")
-    w2.metric("Beta",                   f"{wacc_d['beta']:.2f}", help="2Y weekly returns vs S&P 500")
-    w3.metric("Cost of Equity (CAPM)",  f"{wacc_d['ke']:.2%}", help="Rf + β × 5.5% ERP")
-    w4.metric("After-Tax Cost of Debt", f"{wacc_d['kd']*(1-wacc_d['tax_rate']):.2%}", help="Interest / Debt × (1 − tax rate)")
-    w5.metric("Equity Weight",          f"{wacc_d['we']:.1%}")
-    w6.metric("Debt Weight",            f"{wacc_d['wd']:.1%}")
+    w1,w2,w3,w4,w5,w6,w7 = st.columns(7)
+    w1.metric("Risk-Free Rate",         f"{wacc_d['rf']:.2%}",  help="US 10Y Treasury yield")
+    w2.metric("ERP",                    f"{wacc_d['erp']:.2%}", help="Equity Risk Premium: 20Y S&P 500 total return − risk-free rate")
+    w3.metric("Beta",                   f"{wacc_d['beta']:.2f}", help="2Y weekly returns vs S&P 500")
+    w4.metric("Cost of Equity (CAPM)",  f"{wacc_d['ke']:.2%}",  help="Rf + β × ERP")
+    w5.metric("After-Tax Cost of Debt", f"{wacc_d['kd']*(1-wacc_d['tax_rate']):.2%}", help="Interest / Debt × (1 − tax rate)")
+    w6.metric("Equity Weight",          f"{wacc_d['we']:.1%}")
+    w7.metric("Debt Weight",            f"{wacc_d['wd']:.1%}")
 
     # ── Growth Rate Breakdown ─────────────────────────────────────────────────
     st.subheader("Growth Rate Breakdown")
