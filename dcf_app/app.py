@@ -38,16 +38,36 @@ def fetch_with_retry(fn, retries=3, delay=2):
 def fetch_data(symbol: str) -> dict:
     def _fetch():
         t = yf.Ticker(symbol)
+
         info = t.info
         if not info or info.get("quoteType") is None:
             raise ValueError(f"No data found for '{symbol}'. Please check the ticker symbol.")
+        time.sleep(0.4)
+
+        income_stmt = t.income_stmt
+        time.sleep(0.4)
+
+        balance_sheet = t.balance_sheet
+        time.sleep(0.4)
+
+        cash_flow = t.cashflow
+        time.sleep(0.4)
+
+        try:
+            growth_est = t.growth_estimates
+        except Exception:
+            growth_est = None
+        time.sleep(0.4)
+
+        rf = _get_rf_rate()
+
         return {
             "info": info,
-            "income_stmt": t.income_stmt,
-            "balance_sheet": t.balance_sheet,
-            "cash_flow": t.cashflow,
-            "growth_est": _safe_fetch(t.growth_estimates),
-            "rf": _get_rf_rate(),
+            "income_stmt": income_stmt,
+            "balance_sheet": balance_sheet,
+            "cash_flow": cash_flow,
+            "growth_est": growth_est,
+            "rf": rf,
         }
     return fetch_with_retry(_fetch)
 
