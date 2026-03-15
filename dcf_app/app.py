@@ -4,8 +4,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import requests_cache
-from requests_ratelimiter import LimiterSession
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -20,22 +18,6 @@ st.markdown("""
     div[data-testid="metric-container"] { background: #f8fafc; border-radius: 8px; padding: 10px 14px; }
 </style>
 """, unsafe_allow_html=True)
-
-# ── Cached + rate-limited yfinance session ────────────────────────────────────
-# Caches responses for 1 hour, max 2 requests/second — avoids Yahoo rate limits
-@st.cache_resource
-def get_yf_session():
-    session = requests_cache.CachedSession(
-        cache_name="yfinance_cache",
-        backend="memory",
-        expire_after=3600,
-    )
-    session.headers.update({"User-Agent": "dcf-valuation-tool/1.0"})
-    return session
-
-def make_ticker(symbol: str):
-    """Return a yfinance Ticker using the shared cached session."""
-    return yf.Ticker(symbol, session=get_yf_session())
 
 def fetch_with_retry(fn, retries=3, delay=2):
     """Call fn(), retrying on rate-limit errors with exponential backoff."""
@@ -55,7 +37,7 @@ def fetch_with_retry(fn, retries=3, delay=2):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol: str) -> dict:
     def _fetch():
-        t = make_ticker(symbol)
+        t = yf.Ticker(symbol)
         info = t.info
         if not info or info.get("quoteType") is None:
             raise ValueError(f"No data found for '{symbol}'. Please check the ticker symbol.")
@@ -77,7 +59,7 @@ def _safe_fetch(obj):
 
 def _get_rf_rate() -> float:
     try:
-        tnx = make_ticker("^TNX")
+        tnx = yf.Ticker("^TNX")
         hist = tnx.history(period="5d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1]) / 100
